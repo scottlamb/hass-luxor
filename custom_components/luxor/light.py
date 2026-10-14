@@ -3,6 +3,8 @@ import logging
 from datetime import timedelta
 from functools import partial
 
+from dataclasses import dataclass
+
 from homeassistant.core import callback
 from homeassistant.components.light import (
     ColorMode,
@@ -29,6 +31,37 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class LuxorGroup:
+    grp: int
+    name: str
+    inten: int
+
+
+def _field(g, *keys):
+    for key in keys:
+        value = g.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _normalize_group(g):
+    """Accept both controller dialects.
+
+    ZDC-style controllers send Grp/Inten/Colr; ZD-style controllers send
+    GroupNumber/Intensity. The generated OpenAPI model only knows the former,
+    but keeps unrecognized keys, so look for either.
+    """
+    grp = _field(g, "grp", "GroupNumber")
+    inten = _field(g, "inten", "Intensity")
+    name = _field(g, "name", "Name")
+    if grp is None:
+        _LOGGER.warning("Ignoring Luxor group with no group number: %s", g.to_dict())
+        return None
+    return LuxorGroup(grp=int(grp), name=name or "Group {}".format(int(grp)), inten=int(inten or 0))
 
 async def async_setup_entry(hass, entry, async_add_entities):
     controller = hass.data[DOMAIN][entry.entry_id]
@@ -65,7 +98,8 @@ async def async_fetch_lights(controller):
     api_instance = groups_api.GroupsApi(controller.api)
     api_response = await api_instance.group_list_get()
     if api_response.group_list is not None:
-        controller.lights = {g.grp: g for g in api_response.group_list}
+        groups = [_normalize_group(g) for g in api_response.group_list]
+        controller.lights = {g.grp: g for g in groups if g is not None}
 
 
 @callback
