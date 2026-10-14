@@ -3,6 +3,8 @@ import logging
 from datetime import timedelta
 from functools import partial
 
+from dataclasses import dataclass
+
 from homeassistant.core import callback
 from homeassistant.components.light import (
     ColorMode,
@@ -10,10 +12,12 @@ from homeassistant.components.light import (
 )
 from homeassistant.exceptions import PlatformNotReady
 from homeassistant.helpers.debounce import Debouncer
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
+    UpdateFailed,
 )
 
 import luxor_openapi_asyncio
@@ -24,11 +28,43 @@ from .const import (
     DOMAIN,
     LIGHT,
     REQUEST_REFRESH_DELAY,
+    CONF_HOST,
     CONF_GROUP_INTERVAL,
     DEFAULT_GROUP_INTERVAL,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class LuxorGroup:
+    grp: int
+    name: str
+    inten: int
+
+
+def _field(raw, *keys):
+    for key in keys:
+        value = raw.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _parse_group(raw):
+    """Parse a group from either controller dialect.
+
+    ZDC-style controllers send Grp/Inten/Colr; ZD-style controllers send
+    GroupNumber/Intensity. luxor-openapi-asyncio's Group model only knows the
+    former, so this bypasses it and reads the raw JSON.
+    """
+    grp = _field(raw, "Grp", "GroupNumber")
+    if grp is None:
+        _LOGGER.warning("Ignoring Luxor group with no group number: %s", raw)
+        return None
+    name = _field(raw, "Name") or "Group {}".format(grp)
+    inten = _field(raw, "Inten", "Intensity") or 0
+    return LuxorGroup(grp=int(grp), name=name, inten=int(inten))
 
 async def async_setup_entry(hass, entry, async_add_entities):
     controller = hass.data[DOMAIN][entry.entry_id]
@@ -37,7 +73,12 @@ async def async_setup_entry(hass, entry, async_add_entities):
         hass,
         _LOGGER,
         name="{}_{}".format(DOMAIN, LIGHT),
-        update_method=partial(async_fetch_lights, controller),
+        update_method=partial(
+            async_fetch_lights,
+            async_get_clientsession(hass),
+            entry.data[CONF_HOST],
+            controller,
+        ),
         update_interval=timedelta(seconds=entry.data.get(CONF_GROUP_INTERVAL, DEFAULT_GROUP_INTERVAL)),
         request_refresh_debouncer=Debouncer(
             hass, _LOGGER, cooldown=REQUEST_REFRESH_DELAY, immediate=True
@@ -61,11 +102,17 @@ async def async_setup_entry(hass, entry, async_add_entities):
     await light_coordinator.async_refresh()
 
 
-async def async_fetch_lights(controller):
-    api_instance = groups_api.GroupsApi(controller.api)
-    api_response = await api_instance.group_list_get()
-    if api_response.group_list is not None:
-        controller.lights = {g.grp: g for g in api_response.group_list}
+async def async_fetch_lights(session, host, controller):
+    async with session.post(
+        "http://{}/GroupListGet.json".format(host), json={}
+    ) as resp:
+        resp.raise_for_status()
+        # The controller may not label the response as JSON.
+        body = await resp.json(content_type=None)
+    if body.get("Status", 0) != 0:
+        raise UpdateFailed("GroupListGet returned status {}".format(body.get("Status")))
+    groups = [_parse_group(raw) for raw in body.get("GroupList") or []]
+    controller.lights = {g.grp: g for g in groups if g is not None}
 
 
 @callback
