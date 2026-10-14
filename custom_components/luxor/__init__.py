@@ -55,6 +55,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     return True
 
 
+async def async_remove_config_entry_device(hass, config_entry, device_entry) -> bool:
+    """Allow removing stale devices from the UI."""
+    return True
+
+
 class LuxorController(object):
     def __init__(
         self,
